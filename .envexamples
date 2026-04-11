@@ -1,0 +1,17 @@
+GOOGLE_EMBEDDING_MODEL=gemini-embedding-001
+#GOOGLE_EMBEDDING_MODEL=gemini-embedding-2-preview
+PG_CONNECTION_STRING=postgresql+psycopg://postgres:Pass%40123@localhost:5432/your_db
+GOOGLE_LLM_MODEL=gemini-3.1-pro-preview
+
+LANGSMITH_TRACING=true
+LANGSMITH_ENDPOINT=https://api.smith.langchain.com
+LANGSMITH_API_KEY=
+LANGSMITH_PROJECT=
+
+OPENAI_EMBEDDING_MODEL=text-embedding-3-small 
+OPENAI_REASONING_MODEL=gpt-5-4 
+OPENAI_NON_REASONING_MODEL=gpt-4o-mini 
+
+OPENAI_API_KEY=
+GOOGLE_API_KEY=
+COHERE_API_KEY=

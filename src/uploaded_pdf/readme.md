@@ -1,0 +1,1 @@
+Uploaded pdf's must store in this location 
