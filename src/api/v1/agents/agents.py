@@ -1,5 +1,5 @@
 import os 
-from typing import TypedDict, List 
+from typing import TypedDict, List, Optional 
 
 import cohere 
 from dotenv import load_dotenv 
@@ -12,7 +12,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from src.api.v1.tools.fts_search import fts_search
 from src.api.v1.tools.hybrid_search import hybrid_search
 from src.api.v1.tools.vector_search import vector_search
-from src.api.v1.schemas.query_schema import AIResponse 
+from src.api.v1.schemas.query_schema import AIResponse, FeedBack
 # from src.core.db import get_vector_store 
 
 load_dotenv(override=True) 
@@ -42,6 +42,7 @@ class RAGState(TypedDict):
     response: dict 
     is_valid: str 
     tool: str
+    feedback: Optional[FeedBack]
 
 
 # ============= Tool Call Agent Node =============
@@ -150,42 +151,91 @@ def generate_answer_node(state: RAGState) -> RAGState:
        model=os.getenv("GOOGLE_LLM_MODEL"),
        google_api_key=os.getenv("GOOGLE_API_KEY")
    )
-   structured_llm = agent4.with_structured_output(AIResponse)
+   #structured_llm = agent4.with_structured_output(AIResponse)
 
    context = "\n\n".join([
        f"[Source: {doc.metadata.get('source', 'unknown')} | Page: {doc.metadata.get('page', '?')}]\n{doc.page_content}"
        for doc in state["reranked_docs"]
    ])
 
-   prompt = ChatPromptTemplate.from_messages([
-       (
-           "system",
-           "You are a helpful assistant. Answer the user's question using only the "
-           "provided context. Be precise and always cite the source document and page number."
-       ),
-       ("human", "Context:\n{context}\n\nQuestion: {query}")
-   ])
+   prompt = f"""You are helpful AI Assistant your job is to generate answer for the user query only using the provided content.
+                Check for any feedback if provided and regenerate the answer based on the feedback provided.
+                User Query: {state['query']}
+                Context: {context}
+                Feedback: {state['feeback']}"""
 
-
-   chain = prompt | structured_llm
-   result = chain.invoke({"context": context, "query": state["query"]})
+   result = agent4.invoke(prompt)
 
 
    print(f"[generate_answer_node] Answer generated.")
    print("\n ============= Generator Generated output ================= \n")
    return {**state, "response": result.model_dump()}
 
-# ============= ROUTE =============
+# ============= EVALUATOR NODE ============= 
+import os
+from langchain_google_genai import ChatGoogleGenerativeAI
 
-def route(state: RAGState) -> str:
+def evaluator_node(state: RAGState) -> RAGState:
+    print("\n============= Evaluation started =============\n")
+
+    llm = ChatGoogleGenerativeAI(
+        model=os.getenv("GOOGLE_LLM_MODEL"),
+        google_api_key=os.getenv("GOOGLE_API_KEY"),
+        temperature=0
+    )
+
+    # Enforce structured output
+    evaluator = llm.with_structured_output(FeedBack)
+
+    prompt = f"""
+                You are an evaluator agent.
+
+                Evaluate the generator's response using the following criteria:
+                1. Conciseness – Is the answer clear and to the point?
+                2. Hallucination – Does the answer contain false or made-up information?
+                3. Relevancy – Does the answer directly address the user query?
+
+                User Query: {state['query']}
+                Generated Response:{state['response']}
+
+                Rules:
+                - If the answer is fully satisfactory, respond with:
+                    response="Yes"
+                    feedback fields should briefly confirm quality.
+                - If not satisfactory, respond with:
+                    response="No"
+                    feedback fields should clearly explain issues.
+                """
+
+    evaluation: FeedBack = evaluator.invoke(prompt)
+
+    print("\n============= Evaluation ended =============\n")
+
+    return {
+        **state,
+        "feedback": evaluation.feedback
+    }
+# ============= ROUTE's =============
+
+def validate_route(state: RAGState) -> str:
     
-    print("\n ============= Router Invoked ============= \n") 
+    print("\n ============= Validate Router Invoked ============= \n") 
     if state["is_valid"] == "yes":
-       print("=============== Route -> Genrator ===============")
+       print("=============== Validate Route -> Generator ===============")
     else:
-       print("=============== Route -> Writer ===============")
+       print("=============== Validate Route -> Writer ===============")
 
     return "yes" if state["is_valid"] == "yes" else "no" 
+
+def feedback_route(state: RAGState) -> str:
+
+    print("\n ============= Feedback Router Invoked ============= \n") 
+    if state["feedback"].response == "yes":
+       print("=============== Feedback Route -> END ===============")
+    else:
+       print("=============== Feedback Route -> Generator ===============")
+
+    return "yes" if state['feedback'].response == "yes" else "no" 
 
 # ============= LANG-GRAPH ============= 
 
@@ -197,18 +247,27 @@ def multimodal_rag_graph():
     graph.add_node("generate_answer",generate_answer_node) 
     graph.add_node("validate",validate_node) 
     graph.add_node("rewriter",rewriter_node) 
+    graph.add_node("evaluator", evaluator_node)
 
     graph.set_entry_point("tool_call") 
     graph.add_edge("tool_call","rerank")
     graph.add_edge("rerank","validate") 
     graph.add_conditional_edges("validate",
-                                route,
+                                validate_route,
                                 {
                                     "yes": "generate_answer",
                                     "no": "rewriter"
                                 })
     graph.add_edge("rewriter","tool_call")
-    graph.add_edge("generate_answer",END) 
+    graph.add_edge("generate_answer","evaluator") 
+    graph.add_conditional_edges("evaluator",
+                                feedback_route,
+                                {
+                                    "yes": END,
+                                    "no": "generate_answer"
+                                })
+    graph.add_edge("evaluator","generate_answer") 
+    graph.add_edge("evaluator", END)
 
     return graph.compile() 
 
