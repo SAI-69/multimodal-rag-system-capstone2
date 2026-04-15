@@ -225,9 +225,9 @@ def parse_document(file_path: str) -> list[dict]:
         #   2. .image.pil_image — fallback attribute on some Docling versions
         # The PIL Image is encoded as a base64 PNG and stored in metadata so
         # the Gemini Vision LLM can receive it directly during generation.
+                # ── Pictures, figures, and charts ─────────────────────────────────────
         elif "picture" in label or "figure" in label or label == "chart":
             img_b64 = None
-            # .text on a PictureItem is the inline caption, if any
             caption = getattr(node, "text", "") or ""
 
             try:
@@ -238,7 +238,6 @@ def parse_document(file_path: str) -> list[dict]:
                         pil_img.save(buf, format="PNG")
                         img_b64 = base64.b64encode(buf.getvalue()).decode()
 
-                # Fallback path for older Docling versions
                 if img_b64 is None and hasattr(node, "image") and node.image:
                     pil_img = getattr(node.image, "pil_image", None)
                     if pil_img:
@@ -246,81 +245,94 @@ def parse_document(file_path: str) -> list[dict]:
                         pil_img.save(buf, format="PNG")
                         img_b64 = base64.b64encode(buf.getvalue()).decode()
             except Exception:
-                # Image extraction is best-effort; a missing image is not
-                # fatal — the caption / placeholder text is still indexed.
                 pass
 
-            # Use the caption as the searchable text for this image chunk.
-            # If no caption exists, store a location placeholder so the chunk
-            # is not completely empty (PGVector requires non-empty content).
-            # Generate descriptive caption using Gemini Vision if an image was extracted
-            
             content = caption.strip()
+
+            # Only call VLM if caption is empty but we have an image
             if not content and img_b64 is not None:
+                from langchain_core.messages import HumanMessage  # Lazy import
                 img_hash = hashlib.sha256(base64.b64decode(img_b64.strip())).hexdigest()[:16]
 
                 if img_hash in _IMAGE_CAPTION_CACHE:
                     content = _IMAGE_CAPTION_CACHE[img_hash]
                 else:
+                    vision_prompt = (
+                        "Describe this image for document search. Output a single, concise sentence. "
+                        "Prioritize: exact names > numbers/dates > business context > visual details. "
+                        "Rules: "
+                        "• NO conversational openers ('This image shows', 'visible here') "
+                        "• NO markdown, bullets, or special characters "
+                        "• Logos: '[Company] is a [industry] company specializing in [key areas].' "
+                        "• Charts: '[Metric] [trend/value] for [entity] during [timeframe]. [Key insight].' "
+                        "• Keep under 100 words. Plain text only."
+                    )
+
+                    message = HumanMessage(
+                        content=[
+                            {"type": "text", "text": vision_prompt},
+                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
+                        ]
+                    )
+
+                    raw_content = ""
+
+                    # ── 1️⃣ Try Gemini Primary ─────────────────────────────────────
                     try:
-                        from langchain_core.messages import HumanMessage
                         from langchain_google_genai import ChatGoogleGenerativeAI
-
-                        model_name = os.getenv("GOOGLE_LLM_MODEL", "gemini-3.1-pro-preview")
-                        vision_llm = ChatGoogleGenerativeAI(
-                            model=model_name,
+                        gemini_model = ChatGoogleGenerativeAI(
+                            model=os.getenv("GOOGLE_LLM_MODEL", "gemini-3.1-pro-preivew"),
                             temperature=0,
-                            candidate_count=1
+                            candidate_count=1,
+                            timeout=30,
+                            max_retries=1
                         )
-
-                        message = HumanMessage(
-                            content=[
-                                {
-                                    "type": "text",
-                                    "text": (
-                                        "Describe this image for document search. Output a single, concise sentence. "
-                                        "Prioritize: exact names > numbers/dates > business context > visual details. "
-                                        "Rules: "
-                                        "• NO conversational openers ('This image shows', 'visible here') "
-                                        "• NO markdown, bullets, or special characters "
-                                        "• Logos: '[Company] is a [industry] company specializing in [key areas].' "
-                                        "• Charts: '[Metric] [trend/value] for [entity] during [timeframe]. [Key insight].' "
-                                        "• Keep under 100 words. Plain text only."
-                                    )
-                                },
-                                {
-                                    "type": "image_url",
-                                    "image_url": {"url": f"data:image/png;base64,{img_b64}"}
-                                }
-                            ]
-                        )
-
-                        response = vision_llm.invoke([message])
+                        response = gemini_model.invoke([message])
                         raw_content = getattr(response, "content", "")
+                    except Exception as e:
+                        print(f"[docling_parser] Gemini vision failed: {e}. Falling back to OpenAI...")
 
-                        # Handle LangChain response variations
-                        if isinstance(raw_content, list):
-                            raw_content = raw_content[0].get("text", "") if raw_content else ""
+                    # ── 2️⃣ Fallback to OpenAI ──────────────────────────────────────
+                    # if not raw_content:
+                    #     try:
+                    #         from langchain_openai import ChatOpenAI
+                    #         openai_model = ChatOpenAI(
+                    #             model=os.getenv("OPENAI_VISION_MODEL", "gpt-4o-mini"),
+                    #             temperature=0,
+                    #             timeout=30,
+                    #             max_retries=1
+                    #         )
+                    #         response = openai_model.invoke([message])
+                    #         raw_content = getattr(response, "content", "")
+                    #     except Exception as e:
+                    #         print(f"[docling_parser] OpenAI vision fallback also failed: {e}")
 
-                        content = normalize_vlm_output(str(raw_content), page_no)
+                    # ── Normalize & Cache ──────────────────────────────────────────
+                    if isinstance(raw_content, list):
+                        raw_content = raw_content[0].get("text", "") if raw_content else ""
+
+                    content = normalize_vlm_output(str(raw_content), page_no)
+                    
+                    # Only cache successful, meaningful outputs
+                    if content and "no extractable content" not in content.lower():
                         _IMAGE_CAPTION_CACHE[img_hash] = content
 
-                    except Exception as e:
-                        print(f"[docling_parser] Vision captioning failed: {e}")
-                        content = ""
-
+                # ── Final Safety Fallback ──────────────────────────────────────
                 if not content or len(content.strip()) < 10:
                     content = f"Image on page {page_no or 'unknown'} with no extractable content."
 
+            # Guarantee clean string before DB insertion
             content = str(content).strip()
             if not content.endswith('.'):
                 content += '.'
 
-            parsed_chunks.append({
-                "content": content,
-                "content_type": "image",
-                "metadata": _make_metadata("image", "picture", img_b64),
-            })
+            parsed_chunks.append(
+                {
+                    "content": content,
+                    "content_type": "image",
+                    "metadata": _make_metadata("image", "picture", img_b64),
+                }
+            )            
 
         # ── Plain text: paragraphs, list items, captions, footnotes, etc. ─────
         # Everything that is not a heading, table, or image falls here.
