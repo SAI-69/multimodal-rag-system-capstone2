@@ -121,7 +121,7 @@ if __name__ == "__main__":
     if len(sys.argv) >= 2:
         pdf_path = pathlib.Path(sys.argv[1])
     else:
-        pdf_path = pathlib.Path("data/RIL-Media-Release-RIL-Q2-FY2024-25-mini.pdf")
+        pdf_path = pathlib.Path("data\RIL-Media-Release-RIL-Q2-FY2024-25-mini.pdf")
 
     if not pdf_path.exists():
         raise FileNotFoundError(f"PDF not found at: {pdf_path.resolve()}")
