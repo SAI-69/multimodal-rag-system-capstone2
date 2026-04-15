@@ -1,6 +1,6 @@
 import os
 import ast
-from typing import TypedDict, List, Optional, cast
+from typing import TypedDict, List, Optional
 
 import cohere
 from dotenv import load_dotenv
@@ -9,24 +9,16 @@ from langchain_core.tools import tool
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import StateGraph, END
 
-# =======================
-# SEARCH TOOLS
-# =======================
+# from asyncio import graph
 from src.api.v1.tools.fts_search import fts_search
 from src.api.v1.tools.hybrid_search import hybrid_search
 from src.api.v1.tools.vector_search import vector_search
 
-# =======================
-# DB EXECUTION
-# =======================
 from src.core.readonly_executor import execute_readonly_sql
 from src.api.v1.schemas.query_schema import FeedBack
 
 load_dotenv(override=True)
 
-# =============================================================================
-#                               UTIL
-# =============================================================================
 def extract_llm_text(response) -> str:
     if not response:
         return ""
@@ -36,9 +28,7 @@ def extract_llm_text(response) -> str:
             return first["text"] or ""
     return ""
 
-# =============================================================================
-#                               TOOLS
-# =============================================================================
+
 @tool
 def fts_search_tool(query: str) -> list[Document]:
     """Performs full-text keyword search using PostgreSQL tsvector for exact matches."""
@@ -57,36 +47,34 @@ def hybrid_search_tool(query: str) -> list[Document]:
     return hybrid_search(query)
 
 
-# =============================================================================
-#                               STATE ✅ MODIFIED
-# =============================================================================
-class RAGState(TypedDict):
-    query: str
-    route: str
-
-    vector_query: Optional[str]
-    sql_query: Optional[str]
-
-    retrived_docs: List[Document]
+class VectorState(TypedDict):
+    query: Optional[str]
+    docs: List[Document]
     reranked_docs: List[Document]
-
-    sql: Optional[str]
-    sql_result: Optional[list]
-
-    vector_response: Optional[str]
-    sql_response: Optional[str]
-
-    response: dict
+    answer: Optional[str]
     is_valid: str
     tool: str
+    validate_attempts: int
+    rewrite_count: int
+
+class SQLState(TypedDict):
+    query: Optional[str]
+    sql: Optional[str]
+    rows: Optional[list]
+    answer: Optional[str]
+
+class RAGState(TypedDict):
+    route: str
+    vector: VectorState
+    sql: SQLState
+    response: dict
+
     feedback: Optional[FeedBack]
     answer_attempts: int
     query_history: List[str]
-    rewrite_count: int
+    
 
-# =============================================================================
-#                         QUERY ROUTER
-# =============================================================================
+
 def query_router_node(state: RAGState) -> RAGState:
     llm = ChatGoogleGenerativeAI(
         model=os.getenv("GOOGLE_LLM_MODEL"),
@@ -95,27 +83,25 @@ def query_router_node(state: RAGState) -> RAGState:
     )
 
     prompt = f"""
-You are a query routing assistant for a banking system.
+    You are a query routing assistant for a banking system.
 
-Classify the user query into exactly ONE of the following routes:
+    Classify the user query into exactly ONE of the following routes:
 
-- vector → for conceptual questions such as definitions, explanations, policies, eligibility, or product details
-- rdbms → for factual, numeric, or record-based questions such as balances, transactions, amounts, dates, or account-specific data
-- hybrid → for questions that require BOTH explanation/context AND exact numbers or records
+    - vector → for conceptual questions such as definitions, explanations, policies, eligibility, or product details
+    - rdbms → for factual, numeric, or record-based questions such as balances, transactions, amounts, dates, or account-specific data
+    - hybrid → for questions that require BOTH explanation/context AND exact numbers or records
 
-User Query: "{state['query']}"
+    User Query: "{state['vector']['query']}"
 
-Respond with ONLY ONE word (no extra text):
-vector | rdbms | hybrid
-"""
+    Respond with ONLY ONE word (no extra text):
+    vector | rdbms | hybrid
+    """
 
     route = llm.invoke(prompt).content[0]["text"].strip().lower()
     print(f"ROUTE: {route}")
-    return {**state ,"route": route}
+    return {**state, "route": route}
 
-# =============================================================================
-#                         QUERY SPLITTER ✅ NEW
-# =============================================================================
+
 def query_splitter_node(state: RAGState) -> RAGState:
     llm = ChatGoogleGenerativeAI(
         model=os.getenv("GOOGLE_LLM_MODEL"),
@@ -128,8 +114,7 @@ Split the banking query into:
 1) Vector (conceptual)
 2) SQL (numeric / factual)
 
-Query: "{state['query']}"
-
+Query: "{state['vector']['query']}"
 Reply ONLY as:
 ["vector query", "sql query"]
 """
@@ -138,20 +123,16 @@ Reply ONLY as:
     try:
         vector_q, sql_q = ast.literal_eval(raw)
     except Exception:
-        vector_q = state["query"]
-        sql_q = state["query"]
+        vector_q = sql_q = state["vector"]["query"]
 
     return {
         **state,
-        "vector_query": vector_q,
-        "sql_query": sql_q,
+        "vector": {**state["vector"], "query": vector_q},
+        "sql": {**state["sql"], "query": sql_q},
     }
 
-# =============================================================================
-#                       VECTOR TOOL SELECTOR ✅ MODIFIED
-# =============================================================================
 def tool_call_agent_node(state: RAGState) -> RAGState:
-    query = state.get("vector_query") or state["query"]
+    query = state["vector"]["query"]
 
     llm = ChatGoogleGenerativeAI(
         model=os.getenv("GOOGLE_LLM_MODEL"),
@@ -183,21 +164,67 @@ Query: {query}
         docs = hybrid_search(query)
         tool = "hybrid"
 
-    return {"retrived_docs": docs, "tool": tool}
+    return {
+        "vector": {
+            **state["vector"],
+            "docs": docs,
+            "tool": tool,
+        }
+    }
 
-# =============================================================================
-#                               RERANK
-# =============================================================================
+
+def tool_call_agent_node(state: RAGState) -> RAGState:
+    query = state["vector"]["query"]
+
+    llm = ChatGoogleGenerativeAI(
+        model=os.getenv("GOOGLE_LLM_MODEL"),
+        google_api_key=os.getenv("GOOGLE_API_KEY"),
+        temperature=0,
+    )
+
+    agent = llm.bind_tools(
+        [vector_search_tool, fts_search_tool, hybrid_search_tool]
+    )
+
+    prompt = f"""
+Choose ONE tool:
+fts_search_tool | vector_search_tool | hybrid_search_tool
+
+Query: {query}
+"""
+
+    response = agent.invoke(prompt)
+    chosen = extract_llm_text(response).lower()
+
+    if "fts" in chosen:
+        docs = fts_search(query)
+        tool = "fts"
+    elif "vector" in chosen:
+        docs = vector_search(query)
+        tool = "vector"
+    else:
+        docs = hybrid_search(query)
+        tool = "hybrid"
+
+    return {
+        "vector": {
+            **state["vector"],
+            "docs": docs,
+            "tool": tool,
+        }
+    }
+
+
 def rerank_node(state: RAGState) -> RAGState:
-    docs = state["retrived_docs"]
+    docs = state["vector"]["docs"]
     if not docs:
-        return { "reranked_docs": []}
+        return state
 
     try:
         co = cohere.Client(api_key=os.getenv("COHERE_API_KEY"))
         result = co.rerank(
             model="rerank-v3.5",
-            query=state.get("vector_query") or state["query"],
+            query=state["vector"]["query"],
             documents=[d.page_content for d in docs],
             top_n=5,
         )
@@ -205,11 +232,14 @@ def rerank_node(state: RAGState) -> RAGState:
     except Exception:
         reranked = docs[:5]
 
-    return {"reranked_docs": reranked}
+    return {
+        "vector": {
+            **state["vector"],
+            "reranked_docs": reranked,
+        }
+    }
 
-# =============================================================================
-#                               VALIDATE
-# =============================================================================
+
 def validate_node(state: RAGState) -> RAGState:
     llm = ChatGoogleGenerativeAI(
         model=os.getenv("GOOGLE_LLM_MODEL"),
@@ -217,26 +247,79 @@ def validate_node(state: RAGState) -> RAGState:
         temperature=0,
     )
 
-    context = "\n".join(d.page_content for d in state["reranked_docs"])
+    context = "\n".join(
+        d.page_content for d in state["vector"]["reranked_docs"]
+    )
+
     prompt = f"""
-Query: {state.get("vector_query") or state["query"]}
+Your are a validation assistant for a banking system.
+Based on the retrieved documents, determine if the agent
+can answer the user query.
+
+Query: {state["vector"]["query"]}
 
 Context:
 {context}
 
-Answerable? Reply yes/no
+Answerable? yes/no
 """
 
     ans = llm.invoke(prompt).content[0]["text"].lower()
-    return { "is_valid": "yes" if ans.startswith("yes") else "no"}
 
-# =============================================================================
-#                           VECTOR ANSWER ✅ MODIFIED
-# =============================================================================
+    return {
+        "vector": {
+            **state["vector"],
+            "is_valid": "yes" if ans.startswith("yes") else "no",
+            "validate_attempts": state["vector"]["validate_attempts"] + 1,
+        }
+    }
+
+
+def vector_query_rewriter_node(state: RAGState) -> RAGState:
+    llm = ChatGoogleGenerativeAI(
+        model=os.getenv("GOOGLE_LLM_MODEL"),
+        google_api_key=os.getenv("GOOGLE_API_KEY"),
+        temperature=0.2,  
+    )
+
+    original_query = state["vector"]["query"]
+
+    prompt = f"""
+You are a query rewriting assistant for a banking RAG system.
+
+Rewrite the query to improve document retrieval WITHOUT changing
+its meaning, intent, or adding new information.
+
+Rules:
+- Preserve original intent strictly
+- Do NOT answer the question
+- Do NOT add assumptions
+- Rewrite only once
+
+Original Query:
+{original_query}
+
+Rewritten Query:
+"""
+
+    rewritten = llm.invoke(prompt).content[0]["text"].strip()
+
+    return {
+        "vector": {
+            **state["vector"],
+            "query": rewritten,
+            "rewrite_count": state["vector"]["rewrite_count"] + 1,
+            "docs": [],            # reset downstream artifacts
+            "reranked_docs": [],
+            "is_valid": "",
+        }
+    }
+
+
 def generate_answer_node(state: RAGState) -> RAGState:
-    docs = state["reranked_docs"]
+    docs = state["vector"]["reranked_docs"]
     if not docs:
-        return { "vector_response": "No information found."}
+        return state
 
     context = "\n".join(d.page_content for d in docs)
 
@@ -247,22 +330,26 @@ def generate_answer_node(state: RAGState) -> RAGState:
     )
 
     prompt = f"""
-Context:
-{context}
+    You are an answer generation assistant for a banking system. 
+    Use the provided context to answer the user query. 
+    If you don't know the answer, say you don't know - DO NOT make up an answer.
+    If the answer is not in the context, say you don't know.
 
-Question:
-{state.get("vector_query") or state["query"]}
-"""
+    Question: {state["vector"]["query"]}
+    Context: {context}
+    """
 
     answer = llm.invoke(prompt).content[0]["text"].strip()
-    return {"vector_response": answer}
 
-# =============================================================================
-#                              SQL PLANNER ✅ MODIFIED
-# =============================================================================
+    return {
+        "vector": {
+            **state["vector"],
+            "answer": answer,
+        }
+    }
+
+
 def sql_planner_node(state: RAGState) -> RAGState:
-    query = state.get("sql_query") or state["query"]
-
     llm = ChatGoogleGenerativeAI(
         model=os.getenv("GOOGLE_LLM_MODEL"),
         google_api_key=os.getenv("GOOGLE_API_KEY"),
@@ -270,9 +357,9 @@ def sql_planner_node(state: RAGState) -> RAGState:
     )
 
     prompt = f"""
-You are an expert PostgreSQL query generator for a banking system.
+            You are an expert PostgreSQL query generator for a banking system.
 
-You MUST generate exactly ONE safe, read-only SQL query.
+            You MUST generate exactly ONE safe, read-only SQL query.
 
 ========================
 DATABASE SCHEMA (STRICT)
@@ -372,39 +459,33 @@ CRITICAL RULES (MANDATORY)
 11.  No markdown, no comments, no explanation
 12.  Output ONLY raw SQL
 
-========================
-USER QUERY
-========================
-{state['query']}
 
-========================
-SQL (OUTPUT ONLY)
-========================
+USER QUERY : {state["sql"]["query"]}
+
+Generate the SQL query based on the above schema and rules.
+SQL OUTPUT ONLY
 """
 
     sql = llm.invoke(prompt).content[0]["text"].strip()
-    return {"sql": sql}
 
-# =============================================================================
-#                              SQL EXECUTOR
-# =============================================================================
+    return {
+        "sql": {
+            **state["sql"],
+            "sql": sql,
+        }
+    }
+
+
 def sql_executor_node(state: RAGState) -> RAGState:
-    rows = execute_readonly_sql(state["sql"])
-    return { "sql_result": rows}
+    rows = execute_readonly_sql(state["sql"]["sql"])
+    return {
+        "sql": {
+            **state["sql"],
+            "rows": rows,
+        }
+    }
 
-# =============================================================================
-#                          SQL SUMMARIZER ✅ MODIFIED
-# =============================================================================
-def sql_summarizer_node(state: RAGState) -> RAGState:
-    llm = ChatGoogleGenerativeAI(
-        model=os.getenv("GOOGLE_LLM_MODEL"),
-        google_api_key=os.getenv("GOOGLE_API_KEY"),
-        temperature=0,
-    )
 
-    # =============================================================================
-#                          SQL SUMMARIZER (UPDATED)
-# =============================================================================
 def sql_summarizer_node(state: RAGState) -> RAGState:
     llm = ChatGoogleGenerativeAI(
         model=os.getenv("GOOGLE_LLM_MODEL"),
@@ -415,35 +496,56 @@ def sql_summarizer_node(state: RAGState) -> RAGState:
     prompt = f"""
 You are a professional NorthStar Bank data summarizer.
 
-Query:
-{state.get("sql_query") or state["query"]}
+Query: {state["sql"]["query"]}
 
-Raw SQL Result (Python list of rows):
-{state["sql_result"]}
+Raw SQL Result : {state["sql"]["rows"]}
 
 Rules (MANDATORY):
-- If the result contains transactions/purchases/history → output a clean Markdown table.
-  Columns (use only what exists): Date | Merchant/Description | Category | Amount (INR) | Channel/Type
-  Sort by date DESC.
-- If single-value result (balance, EMI, outstanding, etc.) → output a clear, concise sentence.
-- Professional banking tone. No SQL, no technical jargon.
-- Output ONLY the Markdown/table or summary text. No extra explanation.
+1. Summarize the SQL result in a concise, human-friendly manner.
+2. If the result is empty, say "No data found".
+3. If the result is a single value, return that value directly.
+4. If the result is a list of records, provide a brief summary highlighting key insights or trends, without listing all records.
+5. Do not mention the query or the table names.
+6. Do not use phrases like "According to the data" or "Based on the results".
+7. Do not use markdown or bullet points.
+8. If the query asks for a specific account's data, include the account ID in your summary.
+9. If the query asks for a transaction history, summarize the number of transactions and their types.
+10. If the query asks for a balance, simply state the balance amount.
+11. If the query asks for a loan or FD details, summarize the principal amount, interest rate, and status.
+12. If the query asks for a credit card details, summarize the credit limit, available limit, and status.
+13. If the query asks for a transaction amount, summarize the total amount and the number of transactions.
+14. If the query asks for a transaction category, summarize the categories and their counts.
+15. If the query asks for a transaction channel, summarize the channels and their counts.
+16. If the query asks for a transaction date, summarize the date range and the number of transactions.
+17. If the query asks for a transaction merchant, summarize the merchants and their transaction counts.
+18. If the query asks for a transaction description, summarize the descriptions and their counts.
+19. If the query asks for a transaction type, summarize the types and their counts.
+20. If the query asks for a transaction status, summarize the statuses and their counts.
+21. If the query asks for a transaction category, summarize the categories and their counts.
+22. If the query asks for a transaction channel, summarize the channels and their counts.
+23. If the query asks for a transaction date, summarize the date range and the number of transactions.
+24. If the query asks for a transaction merchant, summarize the merchants and their transaction counts.
+25. If the query asks for a transaction description, summarize the descriptions and their counts.
+26. If the query asks for a transaction type, summarize the types and their counts.
+27. If the query asks for a transaction status, summarize the statuses and their counts.
+28. If the query asks for a transaction category, summarize the categories and their counts.
+29. If the query asks for a transaction channel, summarize the channels and their counts.
+30. If the query asks for a transaction date, summarize the date range and the number of transactions.
 
-Final customer-facing summary:
+Summarize the SQL result based on the above rules.
+
 """
 
     answer = llm.invoke(prompt).content[0]["text"].strip()
-    return { "sql_response": answer}
+
+    return {
+        "sql": {
+            **state["sql"],
+            "answer": answer,
+        }
+    }
 
 
-
-# =============================================================================
-#                       HYBRID MERGER ✅ NEW
-# =============================================================================
-
-# =============================================================================
-#                       HYBRID MERGER → ANSWER SYNTHESIZER (NEW)
-# =============================================================================
 def hybrid_merger_node(state: RAGState) -> RAGState:
     llm = ChatGoogleGenerativeAI(
         model=os.getenv("GOOGLE_LLM_MODEL"),
@@ -452,42 +554,48 @@ def hybrid_merger_node(state: RAGState) -> RAGState:
     )
 
     route = state.get("route", "")
-    vector_ans = state.get("vector_response", "")
-    sql_ans = state.get("sql_response", "")
+    vector_ans = state.get("vector", {}).get("answer", "")
+    sql_ans = state.get("sql", {}).get("answer", "")
 
-    # 1. Build sources from reranked_docs (exactly as in test reports)
     sources: list[dict] = []
-    if state.get("reranked_docs"):
-        for idx, doc in enumerate(state["reranked_docs"]):
+    reranked_docs = state.get("vector", {}).get("reranked_docs", [])
+
+    if reranked_docs:
+        for idx, doc in enumerate(reranked_docs):
             meta = doc.metadata or {}
             sources.append({
                 "rank": idx + 1,
                 "page_number": meta.get("page_number", 0),
                 "section": meta.get("section", ""),
                 "chunk_type": meta.get("chunk_type", "text"),
-                "content_preview": (doc.page_content[:300] + "...") if len(doc.page_content) > 300 else doc.page_content
+                "content_preview": (
+                    doc.page_content[:1500] + "..."
+                    if len(doc.page_content) > 1500
+                    else doc.page_content
+                )
             })
 
-    # 2. Build sql_metadata
     sql_metadata: dict | None = None
-    if state.get("sql") and state.get("sql_result") is not None:
-        rows = state["sql_result"]
+    sql_state = state.get("sql", {})
+    rows = sql_state.get("rows")
+
+    if sql_state.get("sql") and rows is not None:
         sql_metadata = {
-            "sql_query": state.get("sql_query") or state["query"],
-            "executed_sql": state["sql"],
+            "sql_query": sql_state.get("query"),
+            "executed_sql": sql_state.get("sql"),
             "row_count": len(rows) if isinstance(rows, list) else 0,
-            "result_preview": str(rows[:3]) if rows else "No rows returned"
+            "result_preview": str(rows[:3]) if rows else "No rows returned",
         }
 
-    # 3. Synthesize final answer (pure vs hybrid)
     if route != "hybrid":
-        # Pure paths – keep speed
         final_answer = vector_ans if route == "vector" else sql_ans
     else:
-        # Hybrid – true cross-validation + attributions
         vector_source_refs = "\n".join(
-            [f"Page {d.metadata.get('page_number', 'N/A')} - {d.metadata.get('section', 'General')}"
-             for d in state.get("reranked_docs", [])]
+            [
+                f"Page {d.metadata.get('page_number', 'N/A')} - "
+                f"{d.metadata.get('section', 'General')}"
+                for d in reranked_docs
+            ]
         ) or "None"
 
         synth_prompt = f"""
@@ -508,44 +616,51 @@ SQL Records: {sql_metadata['row_count'] if sql_metadata else 0} rows
 Task:
 - Produce ONE coherent, professional customer response.
 - Keep the SQL Markdown table exactly as provided (do not reformat).
-- Add inline attributions: [PDF: Page X - Section Y] for vector facts and [SQL: {sql_metadata['row_count'] if sql_metadata else 0} records] for SQL facts.
+- Add inline attributions: [PDF: Page X - Section Y] for vector facts and
+  [SQL: {sql_metadata['row_count'] if sql_metadata else 0} records] for SQL facts.
 - Cross-validate both sources.
 - Professional banking tone, concise, actionable.
 
 Reply ONLY with the final customer-facing answer (no extra text, no explanations).
 """
 
-    final_answer = llm.invoke(synth_prompt).content[0]["text"].strip()
+        final_answer = llm.invoke(synth_prompt).content[0]["text"].strip()
 
-    # 4. Full compliant output
     full_response = {
         "answer": final_answer,
         "sources": sources,
         "sql_metadata": sql_metadata,
-        "warnings": ["Some vector sources could not be validated"] if state.get("is_valid") == "no" else []
+        "warnings": (
+            ["Some vector sources could not be validated"]
+            if state.get("vector", {}).get("is_valid") == "no"
+            else []
+        ),
     }
 
     return {"response": full_response}
 
+def validation_router(state: RAGState) -> str:
+    if state["vector"]["is_valid"] == "yes":
+        return "pass"
 
-# =============================================================================
-#                               GRAPH ✅ MODIFIED
-# =============================================================================
+    if state["vector"]["validate_attempts"] < 3:
+        return "retry"
+
+    return "fail"
+
 def smart_rag_graph():
     graph = StateGraph(RAGState)
 
     graph.add_node("route", query_router_node)
     graph.add_node("query_split", query_splitter_node)
-
     graph.add_node("tool_call", tool_call_agent_node)
     graph.add_node("rerank", rerank_node)
     graph.add_node("validate", validate_node)
+    graph.add_node("vector_rewrite", vector_query_rewriter_node)
     graph.add_node("generate", generate_answer_node)
-
     graph.add_node("sql_plan", sql_planner_node)
     graph.add_node("sql_exec", sql_executor_node)
     graph.add_node("sql_sum", sql_summarizer_node)
-
     graph.add_node("hybrid_merge", hybrid_merger_node)
 
     graph.set_entry_point("route")
@@ -559,50 +674,56 @@ def smart_rag_graph():
             "hybrid": "query_split",
         },
     )
+    graph.add_conditional_edges(
+    "validate",
+    validation_router,
+        {
+        "pass": "generate",
+        "rewrite": "vector_rewrite",
+        "fail": "generate",
+        },
+    )
+
 
     graph.add_edge("query_split", "tool_call")
     graph.add_edge("query_split", "sql_plan")
-
     graph.add_edge("tool_call", "rerank")
     graph.add_edge("rerank", "validate")
+    graph.add_edge("vector_rewrite", "tool_call")
     graph.add_edge("validate", "generate")
-
     graph.add_edge("sql_plan", "sql_exec")
     graph.add_edge("sql_exec", "sql_sum")
-
     graph.add_edge("generate", "hybrid_merge")
     graph.add_edge("sql_sum", "hybrid_merge")
-
     graph.add_edge("hybrid_merge", END)
 
     return graph.compile()
 
-# =============================================================================
-#                               RUNNER
-# =============================================================================
 rag_graph = smart_rag_graph()
-
-
 image = rag_graph.get_graph().draw_mermaid_png() 
 
-with open("diagram\\new_new_graph.png","wb") as f:
+with open("diagram\\graph_final.png","wb") as f:
     f.write(image)
 
 def run_agent(query: str) -> dict:
     state: RAGState = {
-        "query": query,
         "route": "",
-        "vector_query": None,
-        "sql_query": None,
-        "retrived_docs": [],
-        "reranked_docs": [],
-        "sql": None,
-        "sql_result": None,
-        "vector_response": None,
-        "sql_response": None,
+        "vector": {
+            "query": query,
+            "docs": [],
+            "reranked_docs": [],
+            "answer": None,
+            "is_valid": "",
+            "tool": "",
+            "validate_attempts": 0,
+        },
+        "sql": {
+            "query": query,
+            "sql": None,
+            "rows": None,
+            "answer": None,
+        },
         "response": {},
-        "is_valid": "",
-        "tool": "",
         "feedback": None,
         "answer_attempts": 0,
         "query_history": [],
@@ -610,16 +731,4 @@ def run_agent(query: str) -> dict:
     }
 
     final_state = rag_graph.invoke(state)
-    response_data = final_state.get("response", {})
-
-    # Explicitly return answer + sources (plus metadata/warnings if needed)
-    return {
-        "answer": response_data.get("answer", ""),
-        "sources": response_data.get("sources", []),
-        "sql_metadata": response_data.get("sql_metadata"),
-        "warnings": response_data.get("warnings", [])
-    }
-
-
-
-
+    return final_state["response"]
