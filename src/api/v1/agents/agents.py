@@ -74,7 +74,6 @@ class RAGState(TypedDict):
     query_history: List[str]
     
 
-
 def query_router_node(state: RAGState) -> RAGState:
     llm = ChatGoogleGenerativeAI(
         model=os.getenv("GOOGLE_LLM_MODEL"),
@@ -130,6 +129,7 @@ Reply ONLY as:
         "vector": {**state["vector"], "query": vector_q},
         "sql": {**state["sql"], "query": sql_q},
     }
+
 
 def tool_call_agent_node(state: RAGState) -> RAGState:
     query = state["vector"]["query"]
@@ -639,6 +639,7 @@ Reply ONLY with the final customer-facing answer (no extra text, no explanations
 
     return {"response": full_response}
 
+
 def validation_router(state: RAGState) -> str:
     if state["vector"]["is_valid"] == "yes":
         return "pass"
@@ -679,7 +680,7 @@ def smart_rag_graph():
     validation_router,
         {
         "pass": "generate",
-        "rewrite": "vector_rewrite",
+        "retry": "vector_rewrite",
         "fail": "generate",
         },
     )
