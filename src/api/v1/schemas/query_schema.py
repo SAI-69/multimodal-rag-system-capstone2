@@ -1,7 +1,9 @@
-
 from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
+
+
+# ─── API Schemas ──────────────────────────────────────────────────────────────
 
 class QueryRequest(BaseModel):
     query: str = Field(..., description="User query")
@@ -19,6 +21,23 @@ class QueryResponse(BaseModel):
         default=None,
         description="Metadata about SQL-based answer (tables, filters, row count)"
     )
+
+
+class QueryResponse(BaseModel):
+    answer: str = Field(description="Generated answer")
+
+    sources: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Source metadata for retrieved document chunks (vector search)"
+    )
+
+    sql_metadata: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Metadata about SQL-based answer (tables, filters, row count)"
+    )
+
+
+# ─── Agent Schemas ────────────────────────────────────────────────────────────
 
 class AIResponse(BaseModel):
     query: str = Field(description="The user's original query")
