@@ -3,6 +3,7 @@ import os
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import ChatOpenAI
 
 from src.core.db import similarity_search
 
@@ -22,10 +23,11 @@ _llm = ChatGoogleGenerativeAI(
     google_api_key=os.getenv("GOOGLE_API_KEY"),
 )
 
+# _llm = ChatOpenAI(model= "gpt-4o-mini")
 
 def query_documents(query: str, k: int = 5, chunk_type: str | None = None) -> dict:
     # ── Step 1: Retrieve top-k relevant chunks ────────────────────────────────────────
-    chunks = similarity_search(query, k=k, chunk_type=chunk_type)  # Issue 17
+    chunks = similarity_search(query, k=k, chunk_type=chunk_type)  
 
     # ── Step 2: Build multimodal message content ──────────────────────────────
     # Text and table chunks become plain-text context blocks.
@@ -35,20 +37,28 @@ def query_documents(query: str, k: int = 5, chunk_type: str | None = None) -> di
     sources: list[dict] = []
 
     text_blocks: list[str] = []
+    rank=1
     for chunk in chunks:
+        # print(chunk)
+        chunk_id=chunk.get("id")
         chunk_type = chunk["chunk_type"]
         page = chunk.get("page_number")
         section = chunk.get("section") or "—"
         source_file = chunk.get("source_file", "")
+        image_path= chunk.get("image_path", "")
 
         sources.append({
+            "rank":rank,
+            "chunk_id":chunk_id,
             "chunk_type": chunk_type,
             "page_number": page,
             "section": section,
             "source_file": source_file,
+            "image_path":image_path,
             "element_type": chunk.get("element_type"),
             "similarity": round(chunk.get("similarity", 0), 4),
         })
+        rank=rank+1
 
         if chunk_type in ("text", "table"):
             label = "TABLE" if chunk_type == "table" else "TEXT"
