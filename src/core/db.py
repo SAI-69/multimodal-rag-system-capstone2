@@ -4,13 +4,12 @@ import json
 import os
 import pathlib
 
-import psycopg
 from dotenv import load_dotenv
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 
-load_dotenv()
+load_dotenv(override=True)
 
 # ---------------------------------------------------------------------------
 # Connection setup
@@ -28,8 +27,11 @@ _PG_DSN = _PG_CONNECTION.replace("postgresql+psycopg://", "postgresql://")
 _EMBED_BATCH_SIZE = 50
 
 # ---------------------------------------------------------------------------
-# Issue 8 fix: Module-level embeddings singleton — avoids re-instantiating a
-# new HTTP client on every store_chunks() / similarity_search() call.
+# Embeddings singleton (ingestion only)
+#
+# Used exclusively by store_chunks() to embed content at ingestion time.
+# Search-time embedding is owned by tools/vector_search.py which has its
+# own singleton, keeping db.py as a pure connection / storage layer.
 # ---------------------------------------------------------------------------
 _embeddings_model = GoogleGenerativeAIEmbeddings(
     model=os.getenv("GOOGLE_EMBEDDING_MODEL"),
@@ -148,15 +150,24 @@ def store_chunks(chunks: list[dict], doc_id: str) -> int:
 
     # ── Batch embed all chunks ────────────────────────────────────────────────
     all_embeddings: list[list[float]] = []
+    
     for i in range(0, len(contents), _EMBED_BATCH_SIZE):
         batch = contents[i : i + _EMBED_BATCH_SIZE]
-        # Only call API if batch has valid text (defensive)
-        if batch and all(isinstance(t, str) for t in batch):
-            all_embeddings.extend(_embeddings_model.embed_documents(batch))
-        elif batch:
-            # Last-resort: re-sanitize any rogue items that slipped through
+        
+        if batch:
+            # Ensure all items are definitely strings to prevent silent API drops
             clean_batch = [str(t).strip() if not isinstance(t, str) else t.strip() for t in batch]
-            all_embeddings.extend(_embeddings_model.embed_documents(clean_batch))
+            
+            # Attempt to embed the batch
+            batch_embeddings = _embeddings_model.embed_documents(clean_batch)
+            
+            # 🚨 SELF-HEALING FIX: If the API bugs out and returns a collapsed/truncated batch, 
+            # fall back to embedding them individually using embed_query.
+            if len(batch_embeddings) != len(clean_batch):
+                print(f"⚠️ API batching bug detected (got {len(batch_embeddings)} embeddings for {len(clean_batch)} chunks). Falling back to singular embedding...")
+                batch_embeddings = [_embeddings_model.embed_query(t) for t in clean_batch]
+                
+            all_embeddings.extend(batch_embeddings)
 
     # ── Insert rows ───────────────────────────────────────────────────────────
     # Issue 10 fix: Only store fields in JSONB that don't already have a
@@ -234,120 +245,6 @@ def store_chunks(chunks: list[dict], doc_id: str) -> int:
 
     return rows_inserted
 
-
-# ---------------------------------------------------------------------------
-# Similarity search
-# ---------------------------------------------------------------------------
-
-# def similarity_search(
-#     query: str,
-#     k: int = 5,
-#     chunk_type: str | None = None,
-# ) -> list[dict]:
-#     """Find the k most similar chunks to a natural-language query.
-
-#     Args:
-#         query:      Natural-language question or search string.
-#         k:          Number of results to return.
-#         chunk_type: Optional filter — 'text', 'table', or 'image'.
-
-#     Returns:
-#         List of dicts with keys: content, chunk_type, page_number, section,
-#         source_file, element_type, image_base64, mime_type, position,
-#         metadata, similarity (0–1 cosine similarity score).
-
-#     The <=> operator is pgvector's cosine distance operator.
-#     Similarity = 1 − cosine_distance, so 1.0 = identical, 0.0 = orthogonal.
-#     """
-#     query_vec = _embeddings_model.embed_query(query)  # Issue 8: use singleton
-#     embedding_str = "[" + ",".join(str(v) for v in query_vec) + "]"
-
-#     # Conditionally add a chunk_type filter without SQL injection risk
-#     # (chunk_type is always passed as a parameterised value, never interpolated)
-#     type_clause = "AND chunk_type = %(chunk_type)s" if chunk_type else ""
-
-#     sql = f"""
-#         SELECT
-#             id, content, chunk_type, page_number, section,
-#             source_file, element_type, image_path, mime_type,
-#             position, metadata,
-#             1 - (embedding <=> %(vec)s::vector) AS similarity
-#         FROM multimodal_chunks
-#         WHERE 1=1 {type_clause}
-#         ORDER BY embedding <=> %(vec)s::vector
-#         LIMIT %(k)s
-#     """
-#     # In similarity_search(), after fetching rows:
-
-#  # Debug line
-#     with get_db_conn() as conn:
-#         with conn.cursor() as cur:
-#             cur.execute(sql, {"vec": embedding_str, "chunk_type": chunk_type, "k": k})
-#             rows = cur.fetchall()
-#             # print(f"[DEBUG] First row keys: {rows[0].keys() if rows else 'No rows'}") 
-
-#     # Read image from filesystem and re-encode as base64 for callers.
-#     results = []
-#     for row in rows:
-#         row = dict(row)
-#         img_path = row.pop("image_path", None)
-#         if img_path and os.path.exists(img_path):
-#             row["image_base64"] = base64.b64encode(
-#                 pathlib.Path(img_path).read_bytes()
-#             ).decode()
-#         else:
-#             row["image_base64"] = None
-#         results.append(row)
-
-#     return results
-
-def similarity_search(
-    query: str,
-    k: int = 5,
-    chunk_type: str | None = None,
-) -> list[dict]:
-    query_vec = _embeddings_model.embed_query(query)
-    embedding_str = "[" + ",".join(str(v) for v in query_vec) + "]"
-
-    type_clause = "AND chunk_type = %(chunk_type)s" if chunk_type else ""
-
-    sql = f"""
-        SELECT
-            id, content, chunk_type, page_number, section,
-            source_file, element_type, image_path, mime_type,
-            position, metadata,
-            1 - (embedding <=> %(vec)s::vector) AS similarity
-        FROM multimodal_chunks
-        WHERE 1=1 {type_clause}
-        ORDER BY embedding <=> %(vec)s::vector
-        LIMIT %(k)s
-    """
-
-    with get_db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, {"vec": embedding_str, "chunk_type": chunk_type, "k": k})
-            rows = cur.fetchall()
-            # ✅ Keep your debug line temporarily to verify
-            if rows:
-                print(f"[DEBUG] First row keys: {list(rows[0].keys())}")
-
-    results = []
-    for row in rows:
-        row = dict(row)
-        
-        # ✅ FIX: Use .get() instead of .pop() to PRESERVE image_path in the dict
-        img_path = row.get("image_path")
-        
-        if img_path and os.path.exists(img_path):
-            row["image_base64"] = base64.b64encode(
-                pathlib.Path(img_path).read_bytes()
-            ).decode()
-        else:
-            row["image_base64"] = None
-            
-        results.append(row)
-
-    return results
 
 # ---------------------------------------------------------------------------
 # Chunk listing (for preview / debugging)
