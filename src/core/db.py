@@ -5,6 +5,7 @@ import os
 import pathlib
 
 from dotenv import load_dotenv
+from langchain_community.utilities import SQLDatabase
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
@@ -293,3 +294,19 @@ def get_all_chunks(chunk_type: str | None = None, limit: int = 200) -> list[dict
         results.append(row)
 
     return results
+
+
+def get_sql_database() -> SQLDatabase:
+    """Return a LangChain SQLDatabase connected to the agentic_rag_db (read-only).
+
+    Uses the rag_readonly role from sql/seed.sql — SELECT privileges only.
+    Connection string is read from AGENTIC_RAG_DB_URL in the environment.
+    """
+    db_url = os.getenv("AGENTIC_RAG_DB_URL")
+    if not db_url:
+        raise ValueError("AGENTIC_RAG_DB_URL is not set. Check your .env file.")
+    return SQLDatabase.from_uri(
+        db_url,
+        include_tables=["billing_statements","card_transactions","credit_cards","customers","reward_transactions"],
+        sample_rows_in_table_info=2,
+    )
